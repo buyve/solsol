@@ -1,45 +1,52 @@
 # Solana Memecoin Data Collection System
+
 ## TRD (Technical Requirements Document)
 
-**버전**: 1.0
+**버전**: 2.0
 **상태**: 확정
-**최종 수정**: 2024-12-01
+**최종 수정**: 2024-12-02
+**변경 사항**: Jupiter API v6→v3 마이그레이션, @solana/web3.js 보안 패치, Bull→BullMQ 전환
 
----
+-----
 
 ## 1. 기술 스택
 
 ### 1.1 언어 및 런타임
+
 ```
-언어: TypeScript
+언어: TypeScript 5.x
 런타임: Node.js >= 18.x (LTS)
 패키지 매니저: pnpm
 ```
 
 ### 1.2 주요 의존성
+
 ```json
 {
   "@shyft-to/js": "^0.2.40",
-  "@solana/web3.js": "^1.87.0",
-  "@triton-one/yellowstone-grpc": "^1.x",
+  "@solana/web3.js": "^1.95.8",
+  "@triton-one/yellowstone-grpc": "^4.0.2",
   "pg": "^8.11.0",
   "redis": "^4.6.0",
-  "bull": "^4.12.0",
+  "bullmq": "^5.65.0",
   "express": "^4.18.0",
   "winston": "^3.11.0",
   "dotenv": "^16.3.0"
 }
 ```
 
-### 1.3 인프라
-| 컴포넌트 | 기술 | 버전 |
-|---------|------|------|
-| 영구 저장소 | PostgreSQL | 15+ |
-| 캐시/실시간 | Redis | 7+ |
-| 작업 큐 | Bull (Redis 기반) | 4.x |
-| 컨테이너 | Docker + Docker Compose | - |
+> ⚠️ **보안 경고**: @solana/web3.js 1.95.6, 1.95.7에 공급망 공격으로 인한 악성 코드 포함. **반드시 1.95.8 이상 사용**.
 
----
+### 1.3 인프라
+
+|컴포넌트  |기술                     |버전 |비고                 |
+|------|-----------------------|---|-------------------|
+|영구 저장소|PostgreSQL             |15+|                   |
+|캐시/실시간|Redis                  |7+ |BullMQ 요구사항: 6.2.0+|
+|작업 큐  |BullMQ (Redis 기반)      |5.x|Bull은 유지보수 모드      |
+|컨테이너  |Docker + Docker Compose|-  |                   |
+
+-----
 
 ## 2. 데이터베이스 스키마
 
@@ -167,6 +174,7 @@ CREATE INDEX idx_tx_token_time ON transactions(token_id, block_time DESC);
 ```
 
 ### 2.2 Redis 구조
+
 ```
 # 실시간 가격 캐시 (TTL: 30초)
 price:{mint_address} -> JSON { price_sol, price_usd, sol_usd, updated_at }
@@ -184,7 +192,7 @@ pool:{pool_address} -> JSON { base_reserve, quote_reserve, liquidity_usd }
 rate:sol:usd -> "189.50"
 ```
 
----
+-----
 
 ## 3. 시스템 아키텍처
 
@@ -192,7 +200,7 @@ rate:sol:usd -> "189.50"
 ┌─────────────────────────────────────────────────────────────┐
 │                      DATA SOURCES                           │
 ├──────────────┬──────────────┬──────────────┬───────────────┤
-│ Shyft gRPC   │ Shyft REST   │ Shyft DeFi   │ Jupiter       │
+│ Shyft gRPC   │ Shyft REST   │ Shyft DeFi   │ Jupiter v3    │
 │ (실시간)      │ (토큰/홀더)   │ (풀 정보)     │ (SOL/USD)     │
 └──────┬───────┴──────┬───────┴──────┬───────┴───────┬───────┘
        │              │              │               │
@@ -202,11 +210,12 @@ rate:sol:usd -> "189.50"
 ├──────────────┬──────────────┬──────────────┬───────────────┤
 │ Transaction  │ TokenInfo    │ Pool         │ Holder        │
 │ Streamer     │ Fetcher      │ Monitor      │ Scanner       │
+│ (worker_threads)                                            │
 └──────┬───────┴──────┬───────┴──────┬───────┴───────┬───────┘
        │              │              │               │
        v              v              v               v
 ┌─────────────────────────────────────────────────────────────┐
-│               MESSAGE QUEUE (Bull/Redis)                    │
+│               MESSAGE QUEUE (BullMQ/Redis 7+)               │
 └──────────────────────────┬──────────────────────────────────┘
                            │
                            v
@@ -225,7 +234,7 @@ rate:sol:usd -> "189.50"
 └─────────────────────────────┴───────────────────────────────┘
 ```
 
----
+-----
 
 ## 4. API 연동 상세
 
@@ -236,9 +245,14 @@ rate:sol:usd -> "189.50"
 ```typescript
 import Client from "@triton-one/yellowstone-grpc";
 
+// 지역별 엔드포인트 선택 가능
+// - https://grpc.ams.shyft.to (Amsterdam)
+// - https://grpc.fra.shyft.to (Frankfurt)
+// - etc.
+
 const client = new Client(
-  "YOUR-GRPC-ENDPOINT",  // Shyft 대시보드에서 확인
-  "GRPC-ACCESS-TOKEN",   // x-token
+  "https://grpc.ams.shyft.to",  // Shyft gRPC 엔드포인트
+  "YOUR-ACCESS-XTOKEN",         // x-token 인증
   undefined
 );
 
@@ -257,7 +271,20 @@ const subscribeRequest = {
   blocksMeta: {},
   commitment: 1  // PROCESSED
 };
+
+// LetsBONK.fun (Raydium LaunchLab) 구독
+const bonkSubscribe = {
+  transactions: {
+    letsbonk: {
+      vote: false,
+      failed: false,
+      accountInclude: ["LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj"]
+    }
+  }
+};
 ```
+
+> ⚠️ **제한사항**: $199/월 플랜은 Shared Network로 단일 IP 연결 제한. 고볼륨 처리 시 `worker_threads` 활용 권장.
 
 ### 4.2 Shyft REST API
 
@@ -270,20 +297,26 @@ const tokenInfo = await fetch(
   { headers: { 'x-api-key': SHYFT_API_KEY } }
 );
 
-// 전체 홀더 리스트 (페이지네이션)
+// 홀더 리스트 - SDK 사용 권장 (getOwners 메서드)
+import { ShyftSdk, Network } from '@shyft-to/js';
+
+const shyft = new ShyftSdk({ apiKey: SHYFT_API_KEY, network: Network.Mainnet });
+
+// 페이지네이션 지원
 async function getAllHolders(mint: string): Promise<Holder[]> {
   let page = 1;
   const allHolders: Holder[] = [];
 
   while (true) {
-    const response = await fetch(
-      `https://api.shyft.to/sol/v1/token/get_holders?network=mainnet-beta&token_address=${mint}&page=${page}&size=100`,
-      { headers: { 'x-api-key': SHYFT_API_KEY } }
-    );
-    const data = await response.json();
-    allHolders.push(...data.result.holders);
+    const response = await shyft.token.getOwners({
+      tokenAddress: mint,
+      page,
+      size: 100
+    });
 
-    if (data.result.holders.length < 100) break;
+    allHolders.push(...response);
+
+    if (response.length < 100) break;
     page++;
     await sleep(100); // Rate limit 준수
   }
@@ -299,23 +332,85 @@ async function getAllHolders(mint: string): Promise<Holder[]> {
 ```typescript
 // 토큰의 모든 풀 조회
 const pools = await fetch(
-  `https://defi.shyft.to/v0/pools/get_by_token?token=${mint}`,
+  `https://defi.shyft.to/v0/pools/get_by_token?token=${mint}&limit=100`,
   { headers: { 'x-api-key': SHYFT_API_KEY } }
 );
+
+// 지원 DEX 목록:
+// - pumpFunAmm: pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA
+// - raydiumLaunchpad: LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj
+// - raydiumAmmV4, raydiumClmm, raydiumCpmm
+// - orca, orcaWhirlpool
+// - meteora, meteoraDlmm
 ```
 
-### 4.4 Jupiter Price API
+### 4.4 Jupiter Price API v3 (업데이트됨)
 
-**용도**: SOL/USD 환율
+**용도**: SOL/USD 환율 및 토큰 가격
 
 ```typescript
-// SOL 가격 조회
+// ⚠️ 기존 v6 API (deprecated)
+// const solPrice = await fetch('https://price.jup.ag/v6/price?ids=...');
+
+// ✅ 현재 권장 API (v3 Lite)
+const SOL_MINT = 'So11111111111111111111111111111111111111112';
+
+// 단일 토큰 조회
 const solPrice = await fetch(
-  'https://price.jup.ag/v6/price?ids=So11111111111111111111111111111111111111112'
+  `https://lite-api.jup.ag/price/v3?ids=${SOL_MINT}`
 );
+
+// 배치 조회 (최대 100개, 50개 권장)
+const tokenMints = ['token1', 'token2', ...]; // 최대 100개
+const batchPrice = await fetch(
+  `https://lite-api.jup.ag/price/v3?ids=${tokenMints.join(',')}`
+);
+
+// 응답 구조
+interface JupiterPriceResponse {
+  data: {
+    [mint: string]: {
+      id: string;
+      type: string;
+      price: string;
+      // extraInfo 포함 시 추가 필드
+    };
+  };
+  timeTaken: number;
+}
 ```
 
----
+> ⚠️ **주의사항**:
+>
+> - `lite-api.jup.ag`는 2025년 12월 31일 deprecated 예정
+> - 7일 이내 거래 없거나 저유동성 토큰은 `null` 반환 가능
+> - Rate Limit: 60 req/min (무료), 배치 쿼리로 최적화 필요
+
+### 4.5 Fallback: 온체인 가격 계산
+
+**용도**: Jupiter API 실패 시 대체
+
+```typescript
+// Raydium AMM V4 풀에서 직접 가격 계산
+const RAYDIUM_AMM_V4 = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
+
+async function getOnchainPrice(poolAddress: string): Promise<number | null> {
+  const accountInfo = await connection.getAccountInfo(new PublicKey(poolAddress));
+  if (!accountInfo) return null;
+
+  // AMM V4 레이아웃 파싱 (실제 구현 시 @raydium-io/raydium-sdk 활용)
+  const { baseReserve, quoteReserve, baseDecimals, quoteDecimals } = parseAmmLayout(accountInfo.data);
+
+  return calculatePrice(baseReserve, quoteReserve, baseDecimals, quoteDecimals);
+}
+
+// Orca Whirlpool에서 직접 가격 읽기
+function getWhirlpoolPrice(sqrtPriceX64: bigint): number {
+  return Math.pow(Number(sqrtPriceX64) / Math.pow(2, 64), 2);
+}
+```
+
+-----
 
 ## 5. 핵심 알고리즘
 
@@ -336,6 +431,9 @@ function calculateTokenPriceInSol(
 
 // USD 변환
 const priceUsd = priceSol * solUsdRate;
+
+// Raydium AMM V4 실제 reserve 계산 (OpenBook 통합)
+// vault_balance + open_orders_total - need_take_pnl
 ```
 
 ### 5.2 시가총액/FDV 계산
@@ -403,7 +501,7 @@ function calculateTop10Percentage(
 }
 ```
 
----
+-----
 
 ## 6. 프로젝트 구조
 
@@ -418,7 +516,8 @@ solsol/
 │
 ├── docs/
 │   ├── PRD.md
-│   └── TRD.md
+│   ├── TRD.md
+│   └── PROGRESS.md
 │
 ├── src/
 │   ├── index.ts                    # 진입점
@@ -431,7 +530,7 @@ solsol/
 │   │
 │   ├── services/
 │   │   ├── collectors/
-│   │   │   ├── TransactionStreamer.ts
+│   │   │   ├── TransactionStreamer.ts   # worker_threads 활용
 │   │   │   ├── NewTokenDetector.ts
 │   │   │   ├── TokenInfoFetcher.ts
 │   │   │   ├── PoolMonitor.ts
@@ -446,7 +545,8 @@ solsol/
 │   │   └── external/
 │   │       ├── ShyftClient.ts
 │   │       ├── GrpcClient.ts
-│   │       └── PriceOracle.ts
+│   │       ├── JupiterPriceClient.ts    # v3 API
+│   │       └── OnchainPriceOracle.ts    # Fallback
 │   │
 │   ├── queues/
 │   │   ├── index.ts
@@ -457,7 +557,8 @@ solsol/
 │   ├── workers/
 │   │   ├── PriceUpdateWorker.ts
 │   │   ├── HolderScanWorker.ts
-│   │   └── PoolMonitorWorker.ts
+│   │   ├── PoolMonitorWorker.ts
+│   │   └── GrpcStreamWorker.ts          # worker_threads
 │   │
 │   ├── repositories/
 │   │   ├── TokenRepository.ts
@@ -491,7 +592,7 @@ solsol/
     └── integration/
 ```
 
----
+-----
 
 ## 7. 환경 변수
 
@@ -504,8 +605,11 @@ REDIS_URL=redis://localhost:6379
 
 # Shyft API
 SHYFT_API_KEY=your_api_key_here
-SHYFT_GRPC_ENDPOINT=your_grpc_endpoint
-SHYFT_GRPC_TOKEN=your_grpc_token
+SHYFT_GRPC_ENDPOINT=https://grpc.ams.shyft.to
+SHYFT_GRPC_TOKEN=your_grpc_xtoken
+
+# Jupiter API (v3)
+JUPITER_API_URL=https://lite-api.jup.ag/price/v3
 
 # Solana RPC (백업용)
 SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
@@ -514,9 +618,12 @@ SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
 NODE_ENV=development
 LOG_LEVEL=info
 PORT=3000
+
+# Worker Threads
+GRPC_WORKER_COUNT=2
 ```
 
----
+-----
 
 ## 8. 업데이트 주기 설정
 
@@ -560,12 +667,32 @@ const CACHE_TTL = {
 };
 ```
 
----
+-----
 
-## 9. 참고 자료
+## 9. 런치패드 프로그램 주소 (검증됨)
+
+|플랫폼                    |프로그램 주소                                       |용도               |
+|-----------------------|----------------------------------------------|-----------------|
+|Pump.fun (메인)          |`6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P` |토큰 생성/거래         |
+|PumpSwap AMM           |`pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` |AMM 풀            |
+|Pump.fun 수수료           |`pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ` |수수료 처리           |
+|LetsBONK.fun           |`LanMV9sAd7wArD4vJFi2qDdfnVhFxYSUg6eADduJ3uj` |Raydium LaunchLab|
+|LetsBONK Creator Filter|`FfYek5vEz23cMkWsdJwG2oa6EphsvXSHrGpdALN4g6W1`|생성자 필터           |
+|Moonshot               |`MoonCVVNZFSYkqNXP6bxHLPL6QQJiMagDL3qcqUQTrG` |토큰 생성/거래         |
+|Raydium AMM V4         |`675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8`|Legacy AMM       |
+|Raydium CPMM           |`CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C`|Standard Pool    |
+|Raydium CLMM           |`CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK`|Concentrated     |
+|Orca Whirlpool         |`whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc` |CLMM             |
+
+-----
+
+## 10. 참고 자료
 
 - [Shyft API Reference](https://docs.shyft.to/solana-apis/api-reference)
 - [Shyft Yellowstone gRPC](https://docs.shyft.to/solana-yellowstone-grpc/docs)
 - [Shyft JS SDK](https://www.npmjs.com/package/@shyft-to/js)
+- [Shyft DeFi API](https://docs.shyft.to/solana-defi-apis/defi-apis)
 - [Solana Web3.js](https://solana-labs.github.io/solana-web3.js/)
-- [Jupiter Price API](https://station.jup.ag/docs/apis/price-api)
+- [Jupiter Price API v3](https://dev.jup.ag/docs/price/v3)
+- [BullMQ Documentation](https://docs.bullmq.io/)
+- [Raydium SDK](https://github.com/raydium-io/raydium-sdk)
