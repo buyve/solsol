@@ -1,12 +1,12 @@
 # 구현 진행 상황
 
 **최종 업데이트**: 2024-12-02
-**문서 버전**: 2.4
-**변경 사항**: Phase 4 가격 시스템 완료 (4.1-4.4)
+**문서 버전**: 2.5
+**변경 사항**: Phase 5 거래량/시총 완료 (5.1-5.2)
 
 -----
 
-## 전체 진행률: 61% (14/23 태스크)
+## 전체 진행률: 70% (16/23 태스크)
 
 -----
 
@@ -63,12 +63,12 @@
 
 ## Phase 5: 거래량/시총
 
-|#  |태스크                          |상태  |우선순위|비고|
-|---|-----------------------------|----|----|--|
-|5.1|거래량 집계 (Redis Sliding Window)|⬜ 대기|🔴 높음|  |
-|5.2|시가총액/FDV 계산기                 |⬜ 대기|🔴 높음|  |
+|#  |태스크                          |상태  |우선순위|비고                               |
+|---|-----------------------------|----|----|----------------------------------|
+|5.1|거래량 집계 (Redis Sliding Window)|✅ 완료|🔴 높음|2024-12-02 완료, VolumeAggregator.ts  |
+|5.2|시가총액/FDV 계산기                 |✅ 완료|🔴 높음|2024-12-02 완료, MarketCapCalculator.ts|
 
-**Phase 5 완료 조건**: 24시간 거래량 및 시총 계산 정확도 검증
+**Phase 5 완료 조건**: 24시간 거래량 및 시총 계산 정확도 검증 ✅
 
 -----
 
@@ -204,3 +204,4 @@ cat PROGRESS.md | grep "🔄 진행 중"
 |2.2|2024-12-02|Phase 2 Shyft 클라이언트 완료: ShyftClient, GrpcClient, JupiterPriceClient 구현|
 |2.3|2024-12-02|Phase 3 실시간 데이터 완료 (3.1-3.4): TransactionStreamer, NewTokenDetector, PoolMonitor 구현|
 |2.4|2024-12-02|Phase 4 가격 시스템 완료: OnchainPriceCalculator, SolUsdOracle, PriceService 구현|
+|2.5|2024-12-02|Phase 5 거래량/시총 완료: VolumeAggregator, MarketCapCalculator 구현|
