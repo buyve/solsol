@@ -2,10 +2,9 @@ import { EventEmitter } from 'events';
 import { logger } from '../../utils/logger.js';
 import { cache } from '../../config/redis.js';
 import {
-  JupiterPriceClient,
+  ShyftPriceCalculator,
   PriceResult,
-  SOL_MINT,
-} from '../external/JupiterPriceClient.js';
+} from './ShyftPriceCalculator.js';
 import {
   OnchainPriceCalculator,
   OnchainPrice,
@@ -13,7 +12,7 @@ import {
 } from './OnchainPriceCalculator.js';
 import { SolUsdOracle, OraclePrice } from './SolUsdOracle.js';
 
-export type PriceSource = 'jupiter' | 'onchain' | 'oracle' | 'cache';
+export type PriceSource = 'shyft-pool' | 'onchain' | 'oracle' | 'cache';
 
 export interface TokenPriceInfo {
   mintAddress: string;
@@ -38,7 +37,7 @@ export interface PriceServiceEvents {
 }
 
 export class PriceService extends EventEmitter {
-  private jupiterClient: JupiterPriceClient;
+  private shyftClient: ShyftPriceCalculator;
   private onchainCalculator: OnchainPriceCalculator;
   private solUsdOracle: SolUsdOracle;
   private options: Required<PriceServiceOptions>;
@@ -49,7 +48,7 @@ export class PriceService extends EventEmitter {
 
   constructor(options?: PriceServiceOptions) {
     super();
-    this.jupiterClient = new JupiterPriceClient();
+    this.shyftClient = new ShyftPriceCalculator();
     this.onchainCalculator = new OnchainPriceCalculator();
     this.solUsdOracle = new SolUsdOracle();
 
@@ -71,15 +70,15 @@ export class PriceService extends EventEmitter {
           return { rate: oraclePrice.price, source: 'oracle' };
         }
       } catch (error) {
-        logger.warn('Oracle SOL/USD failed, trying Jupiter', {
+        logger.warn('Oracle SOL/USD failed, trying Shyft pool', {
           error: (error as Error).message,
         });
       }
     }
 
-    // Fallback to Jupiter
-    const jupiterRate = await this.jupiterClient.getSolUsdRate();
-    return { rate: jupiterRate, source: 'jupiter' };
+    // Fallback to Shyft pool-based pricing
+    const shyftRate = await this.shyftClient.getSolUsdRate();
+    return { rate: shyftRate, source: 'shyft-pool' };
   }
 
   /**
@@ -97,17 +96,17 @@ export class PriceService extends EventEmitter {
     // Get SOL/USD rate
     const { rate: solUsdRate, source: rateSource } = await this.getSolUsdRate();
 
-    // Try Jupiter first
+    // Try Shyft pool-based pricing first
     try {
-      const jupiterPrice = await this.jupiterClient.getPrice(mintAddress);
+      const shyftPrice = await this.shyftClient.getTokenPrice(mintAddress);
 
-      if (jupiterPrice && jupiterPrice.price > 0) {
+      if (shyftPrice && shyftPrice.priceUsd > 0) {
         const priceInfo: TokenPriceInfo = {
           mintAddress,
-          priceUsd: jupiterPrice.price,
-          priceSol: jupiterPrice.price / solUsdRate,
-          solUsdRate,
-          source: 'jupiter',
+          priceUsd: shyftPrice.priceUsd,
+          priceSol: shyftPrice.priceSol,
+          solUsdRate: shyftPrice.solUsdRate,
+          source: 'shyft-pool',
           timestamp: new Date(),
         };
 
@@ -116,7 +115,7 @@ export class PriceService extends EventEmitter {
         return priceInfo;
       }
     } catch (error) {
-      logger.warn('Jupiter price fetch failed', {
+      logger.warn('Shyft pool price fetch failed', {
         mintAddress,
         error: (error as Error).message,
       });
@@ -183,31 +182,40 @@ export class PriceService extends EventEmitter {
       return results;
     }
 
-    // Get SOL/USD rate
+    // Get SOL/USD rate once
     const { rate: solUsdRate } = await this.getSolUsdRate();
 
-    // Batch fetch from Jupiter
-    const jupiterPrices = await this.jupiterClient.getBatchPrices(notCached);
+    // Fetch prices from Shyft pools (individual calls with caching)
     const stillMissing: string[] = [];
+    let shyftSuccessCount = 0;
 
     for (const mint of notCached) {
-      const jupiterPrice = jupiterPrices.get(mint);
+      try {
+        const shyftPrice = await this.shyftClient.getTokenPrice(mint);
 
-      if (jupiterPrice && jupiterPrice.price > 0) {
-        const priceInfo: TokenPriceInfo = {
-          mintAddress: mint,
-          priceUsd: jupiterPrice.price,
-          priceSol: jupiterPrice.price / solUsdRate,
-          solUsdRate,
-          source: 'jupiter',
-          timestamp: new Date(),
-        };
+        if (shyftPrice && shyftPrice.priceUsd > 0) {
+          const priceInfo: TokenPriceInfo = {
+            mintAddress: mint,
+            priceUsd: shyftPrice.priceUsd,
+            priceSol: shyftPrice.priceSol,
+            solUsdRate: shyftPrice.solUsdRate,
+            source: 'shyft-pool',
+            timestamp: new Date(),
+          };
 
-        const cacheKey = `${PriceService.CACHE_PREFIX}${mint}`;
-        await cache.set(cacheKey, priceInfo, this.options.cacheTtl);
-        results.set(mint, priceInfo);
-      } else {
+          const cacheKey = `${PriceService.CACHE_PREFIX}${mint}`;
+          await cache.set(cacheKey, priceInfo, this.options.cacheTtl);
+          results.set(mint, priceInfo);
+          shyftSuccessCount++;
+        } else {
+          stillMissing.push(mint);
+        }
+      } catch (error) {
         stillMissing.push(mint);
+        logger.debug('Shyft pool price fetch failed for token', {
+          mint,
+          error: (error as Error).message,
+        });
       }
     }
 
@@ -251,8 +259,8 @@ export class PriceService extends EventEmitter {
       requested: mintAddresses.length,
       found: results.size,
       fromCache: mintAddresses.length - notCached.length,
-      fromJupiter: jupiterPrices.size,
-      fromOnchain: results.size - (mintAddresses.length - notCached.length) - jupiterPrices.size,
+      fromShyft: shyftSuccessCount,
+      fromOnchain: results.size - (mintAddresses.length - notCached.length) - shyftSuccessCount,
     });
 
     return results;
@@ -297,11 +305,11 @@ export class PriceService extends EventEmitter {
    */
   async getPriceStats(): Promise<{
     cacheSize: number;
-    jupiterRateLimit: { remaining: number; resetIn: number };
+    source: string;
   }> {
     return {
       cacheSize: 0, // Would need Redis scan to count
-      jupiterRateLimit: this.jupiterClient.getRateLimitStatus(),
+      source: 'shyft-pool',
     };
   }
 

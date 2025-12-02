@@ -52,10 +52,29 @@ export class MarketCapCalculator {
   async getTokenSupply(mintAddress: string): Promise<TokenSupplyInfo | null> {
     // Check cache first
     const cacheKey = `${MarketCapCalculator.SUPPLY_CACHE_PREFIX}${mintAddress}`;
-    const cached = await cache.get<TokenSupplyInfo>(cacheKey);
+
+    // Cache stores BigInt as strings, so we need a different type for cached data
+    interface CachedTokenSupplyInfo {
+      mintAddress: string;
+      totalSupply: string;
+      circulatingSupply: string;
+      decimals: number;
+      totalSupplyFormatted: number;
+      circulatingSupplyFormatted: number;
+    }
+
+    const cached = await cache.get<CachedTokenSupplyInfo>(cacheKey);
 
     if (cached) {
-      return cached;
+      // Convert string back to BigInt when reading from cache
+      return {
+        mintAddress: cached.mintAddress,
+        totalSupply: BigInt(cached.totalSupply),
+        circulatingSupply: BigInt(cached.circulatingSupply),
+        decimals: cached.decimals,
+        totalSupplyFormatted: cached.totalSupplyFormatted,
+        circulatingSupplyFormatted: cached.circulatingSupplyFormatted,
+      };
     }
 
     try {
@@ -156,10 +175,49 @@ export class MarketCapCalculator {
   async getMarketCap(mintAddress: string): Promise<MarketCapInfo | null> {
     // Check cache first
     const cacheKey = `${MarketCapCalculator.CACHE_PREFIX}${mintAddress}`;
-    const cached = await cache.get<MarketCapInfo>(cacheKey);
+
+    // Cache stores nested BigInt as strings
+    interface CachedMarketCapInfo {
+      mintAddress: string;
+      price: TokenPriceInfo;
+      supply: {
+        mintAddress: string;
+        totalSupply: string;
+        circulatingSupply: string;
+        decimals: number;
+        totalSupplyFormatted: number;
+        circulatingSupplyFormatted: number;
+      };
+      marketCap: number;
+      fullyDilutedValue: number;
+      marketCapSol: number;
+      fdvSol: number;
+      circulatingRatio: number;
+      timestamp: string;
+    }
+
+    const cached = await cache.get<CachedMarketCapInfo>(cacheKey);
 
     if (cached) {
-      return cached;
+      // Convert string back to BigInt when reading from cache
+      return {
+        mintAddress: cached.mintAddress,
+        price: cached.price,
+        supply: {
+          mintAddress: cached.supply.mintAddress,
+          totalSupply: BigInt(cached.supply.totalSupply),
+          circulatingSupply: BigInt(cached.supply.circulatingSupply),
+          decimals: cached.supply.decimals,
+          totalSupplyFormatted: cached.supply.totalSupplyFormatted,
+          circulatingSupplyFormatted: cached.supply.circulatingSupplyFormatted,
+        },
+        marketCap: cached.marketCap,
+        fullyDilutedValue: cached.fullyDilutedValue,
+        marketCapSol: cached.marketCapSol,
+        fdvSol: cached.fdvSol,
+        circulatingRatio: cached.circulatingRatio,
+        timestamp: new Date(cached.timestamp),
+      };
     }
 
     try {
@@ -200,8 +258,25 @@ export class MarketCapCalculator {
         timestamp: new Date(),
       };
 
-      // Cache the result
-      await cache.set(cacheKey, result, this.cacheTtl);
+      // Cache the result with BigInt converted to strings
+      await cache.set(cacheKey, {
+        mintAddress,
+        price,
+        supply: {
+          mintAddress: supply.mintAddress,
+          totalSupply: supply.totalSupply.toString(),
+          circulatingSupply: supply.circulatingSupply.toString(),
+          decimals: supply.decimals,
+          totalSupplyFormatted: supply.totalSupplyFormatted,
+          circulatingSupplyFormatted: supply.circulatingSupplyFormatted,
+        },
+        marketCap,
+        fullyDilutedValue,
+        marketCapSol,
+        fdvSol,
+        circulatingRatio,
+        timestamp: result.timestamp.toISOString(),
+      }, this.cacheTtl);
 
       logger.debug('Market cap calculated', {
         mintAddress,

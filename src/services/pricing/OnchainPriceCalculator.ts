@@ -12,6 +12,7 @@ export const KNOWN_MINTS = {
 };
 
 // Pool account layouts (Raydium AMM V4)
+// Reference: https://github.com/raydium-io/raydium-amm
 const RAYDIUM_AMM_LAYOUT_OFFSETS = {
   baseVault: 72,
   quoteVault: 104,
@@ -28,6 +29,8 @@ export interface PoolReserves {
   quoteDecimals: number;
   baseMint: string;
   quoteMint: string;
+  baseVault: string;
+  quoteVault: string;
 }
 
 export interface OnchainPrice {
@@ -76,17 +79,17 @@ export class OnchainPriceCalculator {
         return null;
       }
 
-      // Parse pool data
+      // Parse pool data including vault addresses
       const reserves = this.parseRaydiumPoolData(accountInfo.data);
 
       if (!reserves) {
         return null;
       }
 
-      // Get vault balances
+      // Get vault balances by reading directly from vault token accounts
       const [baseBalance, quoteBalance] = await Promise.all([
-        this.getTokenBalance(reserves.baseMint, poolAddress),
-        this.getTokenBalance(reserves.quoteMint, poolAddress),
+        this.getVaultBalance(reserves.baseVault),
+        this.getVaultBalance(reserves.quoteVault),
       ]);
 
       if (baseBalance === null || quoteBalance === null) {
@@ -227,13 +230,28 @@ export class OnchainPriceCalculator {
   }
 
   /**
-   * Parse Raydium AMM V4 pool data
+   * Parse Raydium AMM V4 pool data including vault addresses
    */
   private parseRaydiumPoolData(data: Buffer): PoolReserves | null {
     try {
       if (data.length < 500) {
         return null;
       }
+
+      // Extract vault addresses (these are the actual token accounts holding reserves)
+      const baseVault = new PublicKey(
+        data.subarray(
+          RAYDIUM_AMM_LAYOUT_OFFSETS.baseVault,
+          RAYDIUM_AMM_LAYOUT_OFFSETS.baseVault + 32
+        )
+      ).toBase58();
+
+      const quoteVault = new PublicKey(
+        data.subarray(
+          RAYDIUM_AMM_LAYOUT_OFFSETS.quoteVault,
+          RAYDIUM_AMM_LAYOUT_OFFSETS.quoteVault + 32
+        )
+      ).toBase58();
 
       const baseMint = new PublicKey(
         data.subarray(
@@ -259,6 +277,8 @@ export class OnchainPriceCalculator {
         quoteDecimals,
         baseMint,
         quoteMint,
+        baseVault,
+        quoteVault,
       };
     } catch (error) {
       logger.error('Failed to parse Raydium pool data', {
@@ -269,35 +289,38 @@ export class OnchainPriceCalculator {
   }
 
   /**
-   * Get token balance for a vault
+   * Get token balance directly from a vault token account
+   * The vault address IS the token account, not the owner
    */
-  private async getTokenBalance(
-    mint: string,
-    owner: string
-  ): Promise<bigint | null> {
+  private async getVaultBalance(vaultAddress: string): Promise<bigint | null> {
     try {
-      const mintPubkey = new PublicKey(mint);
-      const ownerPubkey = new PublicKey(owner);
+      const vaultPubkey = new PublicKey(vaultAddress);
+      const accountInfo = await this.connection.getAccountInfo(vaultPubkey);
 
-      const tokenAccounts = await this.connection.getTokenAccountsByOwner(
-        ownerPubkey,
-        { mint: mintPubkey }
-      );
-
-      if (tokenAccounts.value.length === 0) {
+      if (!accountInfo?.data) {
+        logger.warn('Vault account not found', { vaultAddress });
         return null;
       }
 
-      // Parse token account data (SPL Token layout)
-      const accountData = tokenAccounts.value[0].account.data;
-      // Amount is at offset 64, 8 bytes (u64)
-      const amount = accountData.readBigUInt64LE(64);
+      // SPL Token account layout:
+      // - mint: 32 bytes (offset 0)
+      // - owner: 32 bytes (offset 32)
+      // - amount: 8 bytes (offset 64)
+      // Total minimum size: 165 bytes
+      if (accountInfo.data.length < 72) {
+        logger.warn('Invalid vault account data', {
+          vaultAddress,
+          dataLength: accountInfo.data.length,
+        });
+        return null;
+      }
 
+      // Amount is at offset 64, 8 bytes (u64 little-endian)
+      const amount = accountInfo.data.readBigUInt64LE(64);
       return amount;
     } catch (error) {
-      logger.error('Failed to get token balance', {
-        mint,
-        owner,
+      logger.error('Failed to get vault balance', {
+        vaultAddress,
         error: (error as Error).message,
       });
       return null;

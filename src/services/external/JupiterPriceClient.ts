@@ -1,14 +1,15 @@
 import { config } from '../../config/index.js';
 import { logger } from '../../utils/logger.js';
 import { cache } from '../../config/redis.js';
+import { jupiterLimiter } from '../queue/RateLimiter.js';
 
 // SOL mint address
 export const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
-// Cache TTLs
+// Cache TTLs - increased to reduce API calls
 const CACHE_TTL = {
-  PRICE: 30,      // 30 seconds
-  SOL_USD: 10,    // 10 seconds
+  PRICE: 60,      // 60 seconds
+  SOL_USD: 60,    // 60 seconds (SOL price doesn't change frequently)
 };
 
 export interface TokenPrice {
@@ -43,16 +44,15 @@ export interface JupiterClientOptions {
   rateLimitPerMinute?: number;
 }
 
-// API Response type
-interface JupiterPriceResponse {
-  data: Record<string, {
-    id: string;
-    type?: string;
-    price: string;
-    extraInfo?: TokenPrice['extraInfo'];
-  } | null>;
-  timeTaken?: number;
+// API Response type for Jupiter v3
+interface JupiterV3TokenData {
+  usdPrice: number;
+  blockId?: number;
+  decimals?: number;
+  priceChange24h?: number;
 }
+
+type JupiterPriceResponse = Record<string, JupiterV3TokenData | null>;
 
 export class JupiterPriceClient {
   private apiUrl: string;
@@ -100,30 +100,51 @@ export class JupiterPriceClient {
   }
 
   /**
-   * Check and enforce rate limit
+   * Check and enforce rate limit using Redis-based rate limiter
    */
   private async checkRateLimit(): Promise<void> {
-    const now = Date.now();
-    const timeSinceFirst = now - this.lastRequestTime;
+    try {
+      const result = await jupiterLimiter.checkLimit();
 
-    // Reset counter every minute
-    if (timeSinceFirst > 60000) {
-      this.requestCount = 0;
-      this.lastRequestTime = now;
-    }
-
-    // Wait if we've hit the limit
-    if (this.requestCount >= this.rateLimitPerMinute) {
-      const waitTime = 60000 - timeSinceFirst;
-      if (waitTime > 0) {
-        logger.debug(`Rate limit reached, waiting ${waitTime}ms`);
-        await this.sleep(waitTime);
-        this.requestCount = 0;
-        this.lastRequestTime = Date.now();
+      if (!result.allowed) {
+        logger.debug('Jupiter rate limit reached, waiting...', {
+          resetIn: result.resetIn,
+          remaining: result.remaining,
+        });
+        await this.sleep(result.resetIn + 100);
       }
-    }
 
-    this.requestCount++;
+      // Also track local counter for quick checks
+      const now = Date.now();
+      const timeSinceFirst = now - this.lastRequestTime;
+
+      if (timeSinceFirst > 60000) {
+        this.requestCount = 0;
+        this.lastRequestTime = now;
+      }
+      this.requestCount++;
+    } catch (error) {
+      // If Redis is unavailable, fall back to local rate limiting
+      const now = Date.now();
+      const timeSinceFirst = now - this.lastRequestTime;
+
+      if (timeSinceFirst > 60000) {
+        this.requestCount = 0;
+        this.lastRequestTime = now;
+      }
+
+      if (this.requestCount >= this.rateLimitPerMinute) {
+        const waitTime = 60000 - timeSinceFirst;
+        if (waitTime > 0) {
+          logger.debug(`Local rate limit reached, waiting ${waitTime}ms`);
+          await this.sleep(waitTime);
+          this.requestCount = 0;
+          this.lastRequestTime = Date.now();
+        }
+      }
+
+      this.requestCount++;
+    }
   }
 
   private sleep(ms: number): Promise<void> {
@@ -150,13 +171,13 @@ export class JupiterPriceClient {
       }
 
       const data = (await response.json()) as JupiterPriceResponse;
-      const solData = data.data?.[SOL_MINT];
+      const solData = data[SOL_MINT];
 
-      if (!solData?.price) {
+      if (!solData?.usdPrice) {
         throw new Error('SOL price not found in response');
       }
 
-      return parseFloat(solData.price);
+      return solData.usdPrice;
     }, 'getSolUsdRate');
 
     // Cache the result
@@ -178,17 +199,15 @@ export class JupiterPriceClient {
       }
 
       const data = (await response.json()) as JupiterPriceResponse;
-      const tokenData = data.data?.[mintAddress];
+      const tokenData = data[mintAddress];
 
-      if (!tokenData?.price) {
+      if (!tokenData?.usdPrice) {
         return null;
       }
 
       return {
         id: mintAddress,
-        price: parseFloat(tokenData.price),
-        type: tokenData.type,
-        extraInfo: tokenData.extraInfo,
+        price: tokenData.usdPrice,
       };
     }, `getPrice(${mintAddress})`);
   }
@@ -221,13 +240,11 @@ export class JupiterPriceClient {
         const prices = new Map<string, TokenPrice>();
 
         for (const mint of batch) {
-          const tokenData = data.data?.[mint];
-          if (tokenData?.price) {
+          const tokenData = data[mint];
+          if (tokenData?.usdPrice) {
             prices.set(mint, {
               id: mint,
-              price: parseFloat(tokenData.price),
-              type: tokenData.type,
-              extraInfo: tokenData.extraInfo,
+              price: tokenData.usdPrice,
             });
           }
         }

@@ -2,11 +2,45 @@ import { Queue, Worker, QueueEvents, Job, ConnectionOptions } from 'bullmq';
 import { config } from '../../config/index.js';
 import { logger } from '../../utils/logger.js';
 
+/**
+ * Parse Redis URL and extract connection options
+ * Handles various URL formats safely
+ */
+function parseRedisUrl(url: string): ConnectionOptions {
+  try {
+    const parsed = new URL(url);
+    const port = parsed.port ? parseInt(parsed.port, 10) : 6379;
+
+    // Validate port is a valid number
+    if (isNaN(port) || port < 1 || port > 65535) {
+      logger.warn('Invalid Redis port, using default 6379', { originalPort: parsed.port });
+      return { host: parsed.hostname || 'localhost', port: 6379 };
+    }
+
+    const connectionOpts: ConnectionOptions = {
+      host: parsed.hostname || 'localhost',
+      port,
+    };
+
+    // Add password if present
+    if (parsed.password) {
+      connectionOpts.password = parsed.password;
+    }
+
+    // Add username if present (Redis 6+ ACL)
+    if (parsed.username) {
+      connectionOpts.username = parsed.username;
+    }
+
+    return connectionOpts;
+  } catch (error) {
+    logger.error('Failed to parse Redis URL, using defaults', { url, error });
+    return { host: 'localhost', port: 6379 };
+  }
+}
+
 // Redis connection for BullMQ
-const connection: ConnectionOptions = {
-  host: new URL(config.redisUrl).hostname,
-  port: parseInt(new URL(config.redisUrl).port || '6379'),
-};
+const connection: ConnectionOptions = parseRedisUrl(config.redisUrl);
 
 // Queue names
 export const QUEUE_NAMES = {

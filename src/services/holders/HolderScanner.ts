@@ -2,14 +2,20 @@ import { Connection, PublicKey } from '@solana/web3.js';
 import { config } from '../../config/index.js';
 import { logger } from '../../utils/logger.js';
 import { cache } from '../../config/redis.js';
-import { shyftClient, TokenHolder } from '../external/ShyftClient.js';
+import { shyftClient, TokenHolder, TokenInfo } from '../external/ShyftClient.js';
 
 export interface HolderInfo {
   address: string;
-  balance: number;
-  balanceRaw: string;
-  percentage: number;
+  balance: number;          // Human-readable balance (adjusted for decimals)
+  balanceRaw: string;       // Raw balance in smallest units
+  percentage: number;       // Percentage of total supply
   rank: number;
+}
+
+export interface TokenMetadata {
+  decimals: number;
+  totalSupply: bigint;
+  totalSupplyFormatted: number;
 }
 
 export interface HolderAnalysis {
@@ -52,7 +58,78 @@ export class HolderScanner {
   }
 
   /**
+   * Get token metadata (decimals, total supply)
+   */
+  async getTokenMetadata(mintAddress: string): Promise<TokenMetadata | null> {
+    const cacheKey = `token:metadata:${mintAddress}`;
+    const cached = await cache.get<TokenMetadata>(cacheKey);
+
+    if (cached) {
+      return {
+        ...cached,
+        totalSupply: BigInt(cached.totalSupply.toString()),
+      };
+    }
+
+    try {
+      // Try Shyft first
+      const tokenInfo = await shyftClient.getTokenInfo(mintAddress);
+
+      if (tokenInfo) {
+        const metadata: TokenMetadata = {
+          decimals: tokenInfo.decimals,
+          totalSupply: BigInt(tokenInfo.totalSupply),
+          totalSupplyFormatted: Number(BigInt(tokenInfo.totalSupply)) / Math.pow(10, tokenInfo.decimals),
+        };
+
+        await cache.set(cacheKey, {
+          decimals: metadata.decimals,
+          totalSupply: metadata.totalSupply.toString(),
+          totalSupplyFormatted: metadata.totalSupplyFormatted,
+        }, 300); // Cache for 5 minutes
+
+        return metadata;
+      }
+
+      // Fallback to RPC
+      const mintPubkey = new PublicKey(mintAddress);
+      const mintInfo = await this.connection.getParsedAccountInfo(mintPubkey);
+
+      if (mintInfo.value?.data && 'parsed' in mintInfo.value.data) {
+        const parsed = mintInfo.value.data.parsed;
+        if (parsed.type === 'mint' && parsed.info) {
+          const decimals = parsed.info.decimals;
+          const supply = BigInt(parsed.info.supply);
+
+          const metadata: TokenMetadata = {
+            decimals,
+            totalSupply: supply,
+            totalSupplyFormatted: Number(supply) / Math.pow(10, decimals),
+          };
+
+          await cache.set(cacheKey, {
+            decimals: metadata.decimals,
+            totalSupply: metadata.totalSupply.toString(),
+            totalSupplyFormatted: metadata.totalSupplyFormatted,
+          }, 300);
+
+          return metadata;
+        }
+      }
+
+      return null;
+    } catch (error) {
+      logger.error('Failed to get token metadata', {
+        mintAddress,
+        error: (error as Error).message,
+      });
+      return null;
+    }
+  }
+
+  /**
    * Get all holders for a token using Shyft API
+   * Properly calculates percentages using actual total supply and decimals
    */
   async getHolders(mintAddress: string): Promise<HolderInfo[]> {
     // Check cache first
@@ -64,6 +141,12 @@ export class HolderScanner {
     }
 
     try {
+      // Get token metadata for accurate calculations
+      const metadata = await this.getTokenMetadata(mintAddress);
+      const decimals = metadata?.decimals ?? 9; // Default to 9 (SOL standard)
+      const totalSupply = metadata?.totalSupply ?? BigInt(0);
+      const divisor = Math.pow(10, decimals);
+
       // Use Shyft to get holders
       const shyftHolders = await shyftClient.getAllHolders(mintAddress, {
         maxPages: Math.ceil(this.maxHolders / 100),
@@ -75,20 +158,36 @@ export class HolderScanner {
         return this.getHoldersFromRpc(mintAddress);
       }
 
-      // Calculate total supply for percentage
-      const totalBalance = shyftHolders.reduce(
-        (sum: number, h: TokenHolder) => sum + parseFloat(h.balance),
-        0
-      );
-
+      // Calculate percentages using actual total supply
+      // Note: Shyft returns balance in raw units (smallest denomination)
       const holders: HolderInfo[] = shyftHolders.map(
-        (holder: TokenHolder, index: number) => ({
-          address: holder.address,
-          balance: parseFloat(holder.balance),
-          balanceRaw: holder.balance,
-          percentage: totalBalance > 0 ? (parseFloat(holder.balance) / totalBalance) * 100 : 0,
-          rank: index + 1,
-        })
+        (holder: TokenHolder, index: number) => {
+          const rawBalance = BigInt(holder.balance);
+          const humanBalance = Number(rawBalance) / divisor;
+
+          // Calculate percentage based on total supply, not sum of holders
+          let percentage = 0;
+          if (totalSupply > BigInt(0)) {
+            percentage = (Number(rawBalance) / Number(totalSupply)) * 100;
+          } else {
+            // Fallback: sum of all balances
+            const sumBalance = shyftHolders.reduce(
+              (sum: bigint, h: TokenHolder) => sum + BigInt(h.balance),
+              BigInt(0)
+            );
+            if (sumBalance > BigInt(0)) {
+              percentage = (Number(rawBalance) / Number(sumBalance)) * 100;
+            }
+          }
+
+          return {
+            address: holder.address,
+            balance: humanBalance,
+            balanceRaw: holder.balance,
+            percentage,
+            rank: index + 1,
+          };
+        }
       );
 
       // Sort by balance descending
@@ -103,6 +202,8 @@ export class HolderScanner {
       logger.debug('Holders fetched from Shyft', {
         mint: mintAddress,
         count: holders.length,
+        decimals,
+        totalSupply: totalSupply.toString(),
       });
 
       return holders;
@@ -119,10 +220,17 @@ export class HolderScanner {
 
   /**
    * Fallback: Get holders using RPC getProgramAccounts
+   * Properly calculates percentages using actual total supply and decimals
    */
   private async getHoldersFromRpc(mintAddress: string): Promise<HolderInfo[]> {
     try {
       const mintPubkey = new PublicKey(mintAddress);
+
+      // Get token metadata for accurate calculations
+      const metadata = await this.getTokenMetadata(mintAddress);
+      const decimals = metadata?.decimals ?? 9;
+      const totalSupply = metadata?.totalSupply ?? BigInt(0);
+      const divisor = Math.pow(10, decimals);
 
       // Get all token accounts for this mint
       const accounts = await this.connection.getProgramAccounts(
@@ -141,21 +249,23 @@ export class HolderScanner {
       );
 
       const holders: HolderInfo[] = [];
-      let totalBalance = BigInt(0);
+      let sumBalance = BigInt(0);
 
       for (const account of accounts) {
         const data = account.account.data;
         // Owner is at offset 32, 32 bytes
         const owner = new PublicKey(data.subarray(32, 64)).toBase58();
         // Amount is at offset 64, 8 bytes (u64)
-        const amount = data.readBigUInt64LE(64);
+        const rawAmount = data.readBigUInt64LE(64);
 
-        if (amount > 0n) {
-          totalBalance += amount;
+        if (rawAmount > 0n) {
+          sumBalance += rawAmount;
+          const humanBalance = Number(rawAmount) / divisor;
+
           holders.push({
             address: owner,
-            balance: Number(amount),
-            balanceRaw: amount.toString(),
+            balance: humanBalance,
+            balanceRaw: rawAmount.toString(),
             percentage: 0, // Will calculate after
             rank: 0,
           });
@@ -165,10 +275,13 @@ export class HolderScanner {
       // Sort by balance descending
       holders.sort((a, b) => b.balance - a.balance);
 
-      // Calculate percentages and ranks
-      const totalBalanceNum = Number(totalBalance);
+      // Calculate percentages using actual total supply or sum of balances
+      const supplyForPercentage = totalSupply > BigInt(0) ? totalSupply : sumBalance;
+      const supplyNum = Number(supplyForPercentage);
+
       holders.forEach((h, i) => {
-        h.percentage = totalBalanceNum > 0 ? (h.balance / totalBalanceNum) * 100 : 0;
+        const rawBalance = BigInt(h.balanceRaw);
+        h.percentage = supplyNum > 0 ? (Number(rawBalance) / supplyNum) * 100 : 0;
         h.rank = i + 1;
       });
 
@@ -183,6 +296,8 @@ export class HolderScanner {
         mint: mintAddress,
         total: accounts.length,
         returned: limitedHolders.length,
+        decimals,
+        totalSupply: totalSupply.toString(),
       });
 
       return limitedHolders;

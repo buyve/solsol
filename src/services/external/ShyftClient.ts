@@ -1,6 +1,7 @@
 import { ShyftSdk, Network } from '@shyft-to/js';
 import { config } from '../../config/index.js';
 import { logger } from '../../utils/logger.js';
+import { shyftRestLimiter } from '../queue/RateLimiter.js';
 
 // Types
 export interface TokenInfo {
@@ -90,7 +91,7 @@ export class ShyftClient {
   }
 
   /**
-   * Execute a function with exponential backoff retry logic
+   * Execute a function with rate limiting and exponential backoff retry logic
    */
   private async withRetry<T>(
     operation: () => Promise<T>,
@@ -100,10 +101,33 @@ export class ShyftClient {
 
     for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
       try {
+        // Check rate limit before making request
+        const rateLimitResult = await shyftRestLimiter.checkLimit();
+        if (!rateLimitResult.allowed) {
+          logger.debug('Rate limit reached, waiting...', {
+            operation: operationName,
+            resetIn: rateLimitResult.resetIn,
+          });
+          await this.sleep(rateLimitResult.resetIn + 100);
+        }
+
         return await operation();
       } catch (error) {
         lastError = error as Error;
         const delay = this.retryDelayMs * Math.pow(2, attempt - 1);
+
+        // Check if it's a rate limit error (429)
+        const isRateLimitError = lastError.message.includes('429') ||
+                                  lastError.message.toLowerCase().includes('rate limit');
+
+        if (isRateLimitError) {
+          logger.warn(`${operationName} rate limited, waiting longer...`, {
+            attempt,
+            waitMs: delay * 2,
+          });
+          await this.sleep(delay * 2);
+          continue;
+        }
 
         logger.warn(`${operationName} failed (attempt ${attempt}/${this.maxRetries})`, {
           error: lastError.message,

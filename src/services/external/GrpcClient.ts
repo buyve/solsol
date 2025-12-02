@@ -1,14 +1,22 @@
-import {
-  CommitmentLevel,
-  SubscribeRequest,
-  SubscribeUpdate,
-} from '@triton-one/yellowstone-grpc';
-// Import the module and extract the default export class
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-import * as YellowstoneModule from '@triton-one/yellowstone-grpc';
+// Use createRequire for CJS module compatibility in ESM
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
 
-// Get the Client class from the module (use unknown to bypass TypeScript module type issues)
-const Client = (YellowstoneModule as unknown as { default: new (endpoint: string, token: string | undefined, options: unknown) => unknown }).default;
+// Import yellowstone-grpc using require for proper CJS compatibility
+const YellowstoneModule = require('@triton-one/yellowstone-grpc');
+const {
+  CommitmentLevel,
+  default: Client,
+} = YellowstoneModule;
+
+// Re-export for other modules to use
+export { CommitmentLevel };
+// Export type for CommitmentLevel enum values
+export type CommitmentLevelType = typeof CommitmentLevel[keyof typeof CommitmentLevel];
+
+// Import types separately
+import type { SubscribeRequest, SubscribeUpdate } from '@triton-one/yellowstone-grpc';
+export type { SubscribeRequest, SubscribeUpdate };
 import { config } from '../../config/index.js';
 import { logger } from '../../utils/logger.js';
 
@@ -329,22 +337,26 @@ export class GrpcClient {
     }
 
     const tx = update.transaction;
+
+    // Convert signature bytes to base58 (Solana standard format)
     const signature = tx.transaction?.signature
-      ? Buffer.from(tx.transaction.signature).toString('base64')
+      ? this.bytesToBase58(tx.transaction.signature)
       : '';
     const slot = Number(tx.slot || 0);
 
     // Extract program IDs from instructions
     const programs: string[] = [];
     const message = tx.transaction?.transaction?.message;
+    const knownProgramsSet: Set<string> = new Set(Object.values(PROGRAM_IDS));
 
     if (message?.accountKeys) {
       message.accountKeys.forEach((key: Uint8Array) => {
-        const pubkey = Buffer.from(key).toString('base64');
-        // Check if this is a known program
-        const knownPrograms = Object.values(PROGRAM_IDS);
-        if (knownPrograms.some(p => pubkey.includes(p.substring(0, 10)))) {
-          programs.push(pubkey);
+        // Convert raw bytes to base58 for proper comparison
+        const pubkeyBase58 = this.bytesToBase58(key);
+
+        // Check if this is a known program by comparing base58 strings
+        if (knownProgramsSet.has(pubkeyBase58)) {
+          programs.push(pubkeyBase58);
         }
       });
     }
@@ -358,6 +370,35 @@ export class GrpcClient {
       programs,
       success: !hasError,
     };
+  }
+
+  /**
+   * Convert raw bytes to base58 string (Solana public key format)
+   */
+  private bytesToBase58(bytes: Uint8Array | Buffer): string {
+    const alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+    const buffer = Buffer.from(bytes);
+
+    if (buffer.length === 0) return '';
+
+    // Count leading zeros
+    let leadingZeros = 0;
+    for (let i = 0; i < buffer.length && buffer[i] === 0; i++) {
+      leadingZeros++;
+    }
+
+    // Convert bytes to big integer
+    let num = BigInt('0x' + buffer.toString('hex'));
+    let result = '';
+
+    while (num > 0n) {
+      const remainder = Number(num % 58n);
+      num = num / 58n;
+      result = alphabet[remainder] + result;
+    }
+
+    // Add leading '1's for zero bytes
+    return '1'.repeat(leadingZeros) + result;
   }
 
   /**

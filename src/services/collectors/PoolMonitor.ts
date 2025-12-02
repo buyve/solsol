@@ -1,10 +1,12 @@
 import { EventEmitter } from 'events';
-import { SubscribeUpdate, SubscribeRequest, CommitmentLevel } from '@triton-one/yellowstone-grpc';
-import { GrpcClient, PROGRAM_IDS } from '../external/GrpcClient.js';
+import { GrpcClient, PROGRAM_IDS, CommitmentLevel } from '../external/GrpcClient.js';
+import type { SubscribeUpdate, SubscribeRequest } from '../external/GrpcClient.js';
 import { ShyftClient, PoolInfo } from '../external/ShyftClient.js';
 import { logger } from '../../utils/logger.js';
 import { cache } from '../../config/redis.js';
 import { bytesToBase58 } from '../../utils/solana.js';
+import { PoolRepository } from '../repositories/PoolRepository.js';
+import { TokenRepository } from '../repositories/TokenRepository.js';
 
 export interface PoolUpdate {
   poolAddress: string;
@@ -25,26 +27,54 @@ export interface PoolMonitorOptions {
   pollIntervalMs?: number;
   cachePoolInfo?: boolean;
   cacheTTL?: number;
+  enablePollingFallback?: boolean; // Enable polling even without Shyft key
+}
+
+export type MonitoringMode = 'grpc' | 'polling' | 'hybrid' | 'disabled';
+
+export interface MonitoringStatus {
+  mode: MonitoringMode;
+  isHealthy: boolean;
+  lastUpdateTime: Date | null;
+  errorCount: number;
+  poolCount: number;
+  details: {
+    grpcConnected: boolean;
+    shyftConfigured: boolean;
+    pollingActive: boolean;
+  };
 }
 
 export class PoolMonitor extends EventEmitter {
   private grpcClient: GrpcClient;
   private shyftClient: ShyftClient;
+  private poolRepository: PoolRepository;
+  private tokenRepository: TokenRepository;
   private isRunning: boolean = false;
   private monitoredPools: Map<string, PoolInfo> = new Map();
+  private pendingPools: Map<string, PoolInfo> = new Map(); // Pools to add to subscription
   private updateCount: number = 0;
   private pollIntervalMs: number;
   private pollIntervalId?: NodeJS.Timeout;
   private cachePoolInfo: boolean;
   private cacheTTL: number;
+  private enablePollingFallback: boolean;
+  private monitoringMode: MonitoringMode = 'disabled';
+  private lastUpdateTime: Date | null = null;
+  private errorCount: number = 0;
+  private resubscribeDebounceId?: NodeJS.Timeout;
+  private grpcConnected: boolean = false;
 
   constructor(options?: PoolMonitorOptions) {
     super();
     this.grpcClient = new GrpcClient();
     this.shyftClient = new ShyftClient();
+    this.poolRepository = new PoolRepository();
+    this.tokenRepository = new TokenRepository();
     this.pollIntervalMs = options?.pollIntervalMs ?? 5000; // 5 seconds default
     this.cachePoolInfo = options?.cachePoolInfo ?? true;
     this.cacheTTL = options?.cacheTTL ?? 300; // 5 minutes
+    this.enablePollingFallback = options?.enablePollingFallback ?? true;
   }
 
   /**
@@ -59,15 +89,40 @@ export class PoolMonitor extends EventEmitter {
     }
 
     this.isRunning = true;
+    this.errorCount = 0;
     logger.info('Starting PoolMonitor...');
 
-    // If gRPC is configured, use real-time monitoring
-    if (this.grpcClient.isConfigured()) {
+    const grpcConfigured = this.grpcClient.isConfigured();
+    const shyftConfigured = this.shyftClient.isConfigured();
+
+    // Determine monitoring mode
+    if (grpcConfigured && shyftConfigured) {
+      this.monitoringMode = 'hybrid';
       await this.startGrpcMonitoring();
-    } else {
-      // Fall back to polling
+      // Also start polling as backup for new pools
       this.startPolling();
+    } else if (grpcConfigured) {
+      this.monitoringMode = 'grpc';
+      await this.startGrpcMonitoring();
+    } else if (shyftConfigured) {
+      this.monitoringMode = 'polling';
+      this.startPolling();
+    } else if (this.enablePollingFallback) {
+      // Minimal polling mode - try to work without API keys
+      this.monitoringMode = 'polling';
+      logger.warn('No API keys configured - running in limited polling mode');
+      this.startPolling();
+    } else {
+      this.monitoringMode = 'disabled';
+      logger.error('No monitoring method available - PoolMonitor disabled');
     }
+
+    logger.info('PoolMonitor started', {
+      mode: this.monitoringMode,
+      grpcConfigured,
+      shyftConfigured,
+      monitoredPools: this.monitoredPools.size,
+    });
 
     this.emit('started');
   }
@@ -77,11 +132,19 @@ export class PoolMonitor extends EventEmitter {
    */
   async stop(): Promise<void> {
     this.isRunning = false;
+    this.monitoringMode = 'disabled';
 
     if (this.pollIntervalId) {
       clearInterval(this.pollIntervalId);
+      this.pollIntervalId = undefined;
     }
 
+    if (this.resubscribeDebounceId) {
+      clearTimeout(this.resubscribeDebounceId);
+      this.resubscribeDebounceId = undefined;
+    }
+
+    this.grpcConnected = false;
     await this.grpcClient.disconnect();
     logger.info('PoolMonitor stopped', {
       totalUpdates: this.updateCount,
@@ -95,6 +158,11 @@ export class PoolMonitor extends EventEmitter {
    */
   async addPool(poolAddress: string, tokenMint?: string): Promise<boolean> {
     try {
+      // Skip if already monitoring
+      if (this.monitoredPools.has(poolAddress)) {
+        return true;
+      }
+
       // Fetch pool info if not provided
       let poolInfo: PoolInfo | null = null;
 
@@ -121,13 +189,22 @@ export class PoolMonitor extends EventEmitter {
 
       this.monitoredPools.set(poolAddress, poolInfo);
 
+      // Track as pending for gRPC resubscription
+      this.pendingPools.set(poolAddress, poolInfo);
+
       // Add to Redis set for persistence
       await this.addToActivePoolsSet(poolAddress);
+
+      // Trigger gRPC resubscription if running in gRPC/hybrid mode
+      if (this.isRunning && (this.monitoringMode === 'grpc' || this.monitoringMode === 'hybrid')) {
+        this.scheduleResubscription();
+      }
 
       logger.info('Pool added to monitoring', {
         poolAddress,
         dex: poolInfo.dex,
         baseMint: poolInfo.baseMint,
+        mode: this.monitoringMode,
       });
 
       return true;
@@ -135,6 +212,38 @@ export class PoolMonitor extends EventEmitter {
       logger.error('Failed to add pool', { poolAddress, error });
       return false;
     }
+  }
+
+  /**
+   * Schedule gRPC resubscription (debounced)
+   * Batches multiple pool additions to avoid excessive reconnections
+   */
+  private scheduleResubscription(): void {
+    if (this.resubscribeDebounceId) {
+      clearTimeout(this.resubscribeDebounceId);
+    }
+
+    // Wait 2 seconds to batch multiple pool additions
+    this.resubscribeDebounceId = setTimeout(async () => {
+      if (this.pendingPools.size > 0 && this.isRunning) {
+        logger.info('Resubscribing gRPC with new pools', {
+          newPoolCount: this.pendingPools.size,
+          totalPools: this.monitoredPools.size,
+        });
+
+        // Clear pending pools
+        this.pendingPools.clear();
+
+        // Reconnect with updated subscription
+        try {
+          await this.grpcClient.disconnect();
+          await this.startGrpcMonitoring();
+        } catch (error) {
+          logger.error('Failed to resubscribe gRPC', { error });
+          this.errorCount++;
+        }
+      }
+    }, 2000);
   }
 
   /**
@@ -174,63 +283,97 @@ export class PoolMonitor extends EventEmitter {
   }
 
   /**
-   * Start gRPC-based real-time monitoring
+   * Start gRPC-based real-time monitoring (non-blocking)
    */
   private async startGrpcMonitoring(): Promise<void> {
     try {
       await this.grpcClient.connect();
+      this.grpcConnected = true;
 
-      // For now, we subscribe to all DEX program transactions
-      // and filter for our monitored pools
+      // Subscribe to account changes for monitored pools (background)
       const request = this.buildAccountSubscription();
 
-      await this.grpcClient.subscribe(request, async (update) => {
-        await this.handleAccountUpdate(update);
+      // Run subscription in background
+      this.runGrpcSubscriptionLoop(request);
+
+      logger.info('PoolMonitor gRPC subscription started in background', {
+        monitoredPools: this.monitoredPools.size,
       });
     } catch (error) {
+      this.grpcConnected = false;
+      this.errorCount++;
       logger.error('gRPC monitoring failed, falling back to polling', { error });
-      this.startPolling();
+
+      // Only start polling if not already running
+      if (!this.pollIntervalId) {
+        this.monitoringMode = 'polling';
+        this.startPolling();
+      }
     }
   }
 
   /**
-   * Build account subscription request
+   * Run gRPC subscription loop in background
+   */
+  private runGrpcSubscriptionLoop(request: SubscribeRequest): void {
+    this.grpcClient.subscribe(request, async (update) => {
+      await this.handleAccountUpdate(update);
+      this.lastUpdateTime = new Date();
+    }).catch((error) => {
+      this.grpcConnected = false;
+      this.errorCount++;
+
+      if (!this.isRunning) return; // Expected during shutdown
+
+      logger.error('PoolMonitor gRPC subscription error, falling back to polling', { error });
+
+      // Only start polling if not already running
+      if (!this.pollIntervalId) {
+        this.monitoringMode = 'polling';
+        this.startPolling();
+      }
+    });
+  }
+
+  /**
+   * Build account subscription request for monitored pools
+   * This subscribes directly to account data changes, not transactions
    */
   private buildAccountSubscription(): SubscribeRequest {
-    // Subscribe to all DEX program transactions to detect pool changes
+    const accounts: SubscribeRequest['accounts'] = {};
+
+    // Subscribe to each monitored pool account directly
+    // This gives us real-time updates when pool reserves change
+    let index = 0;
+    for (const poolAddress of this.monitoredPools.keys()) {
+      accounts[`pool_${index}`] = {
+        account: [poolAddress],
+        owner: [],
+        filters: [],
+      };
+      index++;
+    }
+
+    // If no pools are monitored yet, subscribe to DEX program accounts
+    // to catch new pools
+    if (index === 0) {
+      // Subscribe by program owner to catch all pools for major DEXes
+      accounts['raydium_pools'] = {
+        account: [],
+        owner: [PROGRAM_IDS.RAYDIUM_AMM_V4],
+        filters: [],
+      };
+      accounts['pumpswap_pools'] = {
+        account: [],
+        owner: [PROGRAM_IDS.PUMP_SWAP_AMM],
+        filters: [],
+      };
+    }
+
     return {
-      accounts: {},
+      accounts,
       slots: {},
-      transactions: {
-        raydium_amm: {
-          vote: false,
-          failed: false,
-          accountInclude: [PROGRAM_IDS.RAYDIUM_AMM_V4],
-          accountExclude: [],
-          accountRequired: [],
-        },
-        raydium_cpmm: {
-          vote: false,
-          failed: false,
-          accountInclude: [PROGRAM_IDS.RAYDIUM_CPMM],
-          accountExclude: [],
-          accountRequired: [],
-        },
-        pumpswap: {
-          vote: false,
-          failed: false,
-          accountInclude: [PROGRAM_IDS.PUMP_SWAP_AMM],
-          accountExclude: [],
-          accountRequired: [],
-        },
-        orca: {
-          vote: false,
-          failed: false,
-          accountInclude: [PROGRAM_IDS.ORCA_WHIRLPOOL],
-          accountExclude: [],
-          accountRequired: [],
-        },
-      },
+      transactions: {},
       transactionsStatus: {},
       blocks: {},
       blocksMeta: {},
@@ -245,21 +388,37 @@ export class PoolMonitor extends EventEmitter {
    * Handle account update from gRPC
    */
   private async handleAccountUpdate(update: SubscribeUpdate): Promise<void> {
-    // Process transaction to find pool account changes
-    if (!update.transaction) return;
+    // Handle direct account updates (preferred method)
+    if (update.account) {
+      const account = update.account;
+      const pubkey = account.account?.pubkey;
 
-    const tx = update.transaction;
-    const message = tx.transaction?.transaction?.message;
-    if (!message?.accountKeys) return;
+      if (pubkey) {
+        const poolAddress = bytesToBase58(pubkey);
 
-    const accountKeys = message.accountKeys.map((key: Uint8Array) =>
-      bytesToBase58(key)
-    );
+        // Check if this is a monitored pool
+        if (this.monitoredPools.has(poolAddress)) {
+          await this.refreshPoolAndEmit(poolAddress, Number(account.slot || 0));
+        }
+      }
+      return;
+    }
 
-    // Check if any monitored pools are involved
-    for (const poolAddress of this.monitoredPools.keys()) {
-      if (accountKeys.includes(poolAddress)) {
-        await this.refreshPoolAndEmit(poolAddress, Number(tx.slot));
+    // Fallback: handle transaction updates for pools involved in swaps
+    if (update.transaction) {
+      const tx = update.transaction;
+      const message = tx.transaction?.transaction?.message;
+      if (!message?.accountKeys) return;
+
+      const accountKeys = message.accountKeys.map((key: Uint8Array) =>
+        bytesToBase58(key)
+      );
+
+      // Check if any monitored pools are involved
+      for (const poolAddress of this.monitoredPools.keys()) {
+        if (accountKeys.includes(poolAddress)) {
+          await this.refreshPoolAndEmit(poolAddress, Number(tx.slot));
+        }
       }
     }
   }
@@ -284,7 +443,24 @@ export class PoolMonitor extends EventEmitter {
    * Poll all monitored pools for updates
    */
   private async pollAllPools(): Promise<void> {
-    if (!this.shyftClient.isConfigured()) return;
+    if (this.monitoredPools.size === 0) {
+      logger.debug('No pools to poll');
+      return;
+    }
+
+    if (!this.shyftClient.isConfigured()) {
+      // Log only periodically to avoid spam
+      if (this.updateCount % 12 === 0) {
+        logger.debug('Polling skipped - Shyft client not configured', {
+          monitoredPools: this.monitoredPools.size,
+        });
+      }
+      this.updateCount++;
+      return;
+    }
+
+    let updatedCount = 0;
+    let errorCount = 0;
 
     for (const [poolAddress, previousInfo] of this.monitoredPools) {
       try {
@@ -294,13 +470,25 @@ export class PoolMonitor extends EventEmitter {
         // Check for changes
         if (this.hasPoolChanged(previousInfo, currentInfo)) {
           await this.emitPoolUpdate(poolAddress, previousInfo, currentInfo);
+          updatedCount++;
         }
 
         // Update stored info
         this.monitoredPools.set(poolAddress, currentInfo);
+        this.lastUpdateTime = new Date();
       } catch (error) {
+        errorCount++;
+        this.errorCount++;
         logger.error('Failed to poll pool', { poolAddress, error });
       }
+    }
+
+    if (updatedCount > 0 || errorCount > 0) {
+      logger.debug('Poll cycle completed', {
+        updated: updatedCount,
+        errors: errorCount,
+        total: this.monitoredPools.size,
+      });
     }
   }
 
@@ -386,11 +574,58 @@ export class PoolMonitor extends EventEmitter {
       await this.cachePoolUpdate(update);
     }
 
+    // Persist to database
+    await this.savePoolToDatabase(update, current);
+
     logger.debug('Pool update detected', {
       poolAddress: poolAddress.substring(0, 10) + '...',
       priceChange: priceChange.toFixed(2) + '%',
       liquidityChange: liquidityChange.toFixed(2) + '%',
     });
+  }
+
+  /**
+   * Save pool update to database
+   */
+  private async savePoolToDatabase(update: PoolUpdate, poolInfo: PoolInfo): Promise<void> {
+    try {
+      // Get or create token record
+      let tokenId = await this.tokenRepository.getTokenIdByMint(update.tokenMint);
+
+      if (!tokenId) {
+        tokenId = await this.tokenRepository.upsertToken({
+          mintAddress: update.tokenMint,
+          isActive: true,
+        });
+      }
+
+      if (!tokenId) {
+        logger.warn('Failed to get/create token for pool', { poolAddress: update.poolAddress });
+        return;
+      }
+
+      // Calculate liquidity in USD (rough estimate based on SOL price)
+      // In production, you'd want to get the actual SOL/USD rate
+      const liquidityUsd = Number(update.quoteReserve) / 1e9 * 200; // Rough SOL price
+
+      // Upsert pool record
+      await this.poolRepository.upsertPool({
+        tokenId,
+        poolAddress: update.poolAddress,
+        dexName: update.dex,
+        baseMint: update.tokenMint,
+        quoteMint: update.quoteMint,
+        baseReserve: update.baseReserve.toString(),
+        quoteReserve: update.quoteReserve.toString(),
+        liquidityUsd,
+        isActive: true,
+      });
+    } catch (error) {
+      logger.error('Failed to save pool to database', {
+        poolAddress: update.poolAddress,
+        error: (error as Error).message,
+      });
+    }
   }
 
   /**
@@ -443,12 +678,57 @@ export class PoolMonitor extends EventEmitter {
     isRunning: boolean;
     monitoredPools: number;
     updateCount: number;
+    mode: MonitoringMode;
   } {
     return {
       isRunning: this.isRunning,
       monitoredPools: this.monitoredPools.size,
       updateCount: this.updateCount,
+      mode: this.monitoringMode,
     };
+  }
+
+  /**
+   * Get detailed monitoring status for health checks
+   */
+  getMonitoringStatus(): MonitoringStatus {
+    // Calculate health based on recent activity and error rate
+    const now = new Date();
+    const timeSinceLastUpdate = this.lastUpdateTime
+      ? (now.getTime() - this.lastUpdateTime.getTime()) / 1000
+      : Infinity;
+
+    // Consider healthy if:
+    // - Not running (disabled mode is expected)
+    // - OR last update was within 5 minutes and error rate is low
+    const isHealthy =
+      this.monitoringMode === 'disabled' ||
+      (timeSinceLastUpdate < 300 && this.errorCount < 10) ||
+      (this.monitoredPools.size === 0); // No pools = nothing to monitor
+
+    return {
+      mode: this.monitoringMode,
+      isHealthy,
+      lastUpdateTime: this.lastUpdateTime,
+      errorCount: this.errorCount,
+      poolCount: this.monitoredPools.size,
+      details: {
+        grpcConnected: this.grpcConnected,
+        shyftConfigured: this.shyftClient.isConfigured(),
+        pollingActive: !!this.pollIntervalId,
+      },
+    };
+  }
+
+  /**
+   * Check if monitoring is effectively disabled
+   * Used by health checks to determine actual monitoring state
+   */
+  isEffectivelyDisabled(): boolean {
+    return (
+      this.monitoringMode === 'disabled' ||
+      (!this.grpcConnected && !this.pollIntervalId && !this.shyftClient.isConfigured())
+    );
   }
 
   /**
