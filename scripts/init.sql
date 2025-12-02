@@ -108,7 +108,7 @@ CREATE TABLE IF NOT EXISTS transactions (
 -- 모니터링 대상
 CREATE TABLE IF NOT EXISTS monitored_tokens (
     id SERIAL PRIMARY KEY,
-    token_id INTEGER REFERENCES tokens(id) ON DELETE CASCADE,
+    token_id INTEGER UNIQUE REFERENCES tokens(id) ON DELETE CASCADE,
     priority SMALLINT DEFAULT 1,
     update_interval_sec INTEGER DEFAULT 60,
     last_price_update TIMESTAMP WITH TIME ZONE,
@@ -151,6 +151,28 @@ CREATE TRIGGER update_pools_updated_at
     BEFORE UPDATE ON liquidity_pools
     FOR EACH ROW
     EXECUTE FUNCTION update_updated_at_column();
+
+-- 기존 테이블에 누락된 제약조건 추가 (마이그레이션)
+DO $$
+BEGIN
+    -- monitored_tokens.token_id에 UNIQUE 제약조건이 없으면 추가
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'monitored_tokens_token_id_key'
+        OR conname = 'unique_monitored_token_id'
+    ) THEN
+        -- 먼저 중복 데이터 정리 (가장 최근 것만 유지)
+        DELETE FROM monitored_tokens a USING monitored_tokens b
+        WHERE a.id < b.id AND a.token_id = b.token_id;
+
+        -- UNIQUE 제약조건 추가
+        ALTER TABLE monitored_tokens ADD CONSTRAINT unique_monitored_token_id UNIQUE (token_id);
+        RAISE NOTICE 'Added UNIQUE constraint to monitored_tokens.token_id';
+    END IF;
+EXCEPTION
+    WHEN duplicate_object THEN
+        RAISE NOTICE 'UNIQUE constraint already exists on monitored_tokens.token_id';
+END $$;
 
 -- 완료 메시지
 DO $$

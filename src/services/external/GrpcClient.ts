@@ -56,7 +56,7 @@ export interface SubscriptionOptions {
   name: string;
   programs?: string[];
   accounts?: string[];
-  commitment?: CommitmentLevel;
+  commitment?: CommitmentLevelType;
   includeVote?: boolean;
   includeFailed?: boolean;
 }

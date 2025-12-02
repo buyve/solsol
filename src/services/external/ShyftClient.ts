@@ -120,6 +120,9 @@ export class ShyftClient {
         const isRateLimitError = lastError.message.includes('429') ||
                                   lastError.message.toLowerCase().includes('rate limit');
 
+        // Check if it's a 417 Expectation Failed (token not yet indexed)
+        const isNotIndexedError = lastError.message.includes('417');
+
         if (isRateLimitError) {
           logger.warn(`${operationName} rate limited, waiting longer...`, {
             attempt,
@@ -127,6 +130,12 @@ export class ShyftClient {
           });
           await this.sleep(delay * 2);
           continue;
+        }
+
+        // 417 errors should not be retried - token is not indexed yet
+        if (isNotIndexedError) {
+          logger.debug(`${operationName} - token not yet indexed (417)`, { attempt });
+          throw lastError; // Exit early, no point in retrying
         }
 
         logger.warn(`${operationName} failed (attempt ${attempt}/${this.maxRetries})`, {
@@ -160,7 +169,13 @@ export class ShyftClient {
       );
 
       if (!response.ok) {
-        if (response.status === 404) {
+        // 404: Token not found
+        // 417: Expectation Failed - token not yet indexed (newly created tokens)
+        if (response.status === 404 || response.status === 417) {
+          logger.debug('Token not found or not yet indexed', {
+            mint: mintAddress,
+            status: response.status,
+          });
           return null;
         }
         throw new Error(`Shyft API error: ${response.status} ${response.statusText}`);
