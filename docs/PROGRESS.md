@@ -1,19 +1,19 @@
 # 구현 진행 상황
 
-**최종 업데이트**: 2024-12-01
+**최종 업데이트**: 2024-12-02
 
 ---
 
-## 전체 진행률: 0%
+## 전체 진행률: 14% (3/21 태스크 완료)
 
 ---
 
 ## Phase 1: 기반 구축
 | # | 태스크 | 상태 | 비고 |
 |---|--------|------|------|
-| 1 | 프로젝트 초기화 (TypeScript, pnpm, Docker) | ⬜ 대기 | |
-| 2 | PostgreSQL 스키마 생성 | ⬜ 대기 | |
-| 3 | Redis 연결 설정 | ⬜ 대기 | |
+| 1 | 프로젝트 초기화 (TypeScript, pnpm, Docker) | ✅ 완료 | package.json, tsconfig.json, docker-compose.yml |
+| 2 | PostgreSQL 스키마 생성 | ✅ 완료 | scripts/migrate.ts, 8개 테이블 + 인덱스 |
+| 3 | Redis 연결 설정 | ✅ 완료 | src/config/redis.ts, 캐시 헬퍼 함수 포함 |
 | 4 | Shyft API 키 발급 (gRPC + REST) | ⬜ 대기 | 사용자 진행 필요 |
 
 ---
@@ -79,6 +79,52 @@
 
 ---
 
+## 완료된 작업 상세
+
+### Phase 1 완료 내역 (2024-12-02)
+
+#### 1. 프로젝트 구조
+```
+solsol/
+├── package.json          # 의존성 정의
+├── tsconfig.json         # TypeScript 설정
+├── docker-compose.yml    # PostgreSQL, Redis 컨테이너
+├── .env.example          # 환경 변수 템플릿
+├── .gitignore
+├── src/
+│   ├── index.ts          # 진입점
+│   ├── config/
+│   │   ├── index.ts      # 환경 변수 로드
+│   │   ├── database.ts   # PostgreSQL 연결
+│   │   ├── redis.ts      # Redis 연결 + 캐시 헬퍼
+│   │   └── shyft.ts      # Shyft API 설정
+│   ├── types/
+│   │   ├── token.ts      # 토큰 타입
+│   │   ├── pool.ts       # 풀 타입
+│   │   ├── holder.ts     # 홀더 타입
+│   │   └── transaction.ts # 트랜잭션 타입
+│   └── utils/
+│       ├── logger.ts     # Winston 로거
+│       ├── math.ts       # 가격/시총 계산
+│       └── solana.ts     # Solana 유틸리티
+└── scripts/
+    └── migrate.ts        # DB 마이그레이션
+```
+
+#### 2. 설치된 의존성
+- @shyft-to/js, @solana/web3.js, @triton-one/yellowstone-grpc
+- pg, redis, bull
+- express, winston, dotenv
+- TypeScript, tsx, eslint
+
+#### 3. DB 스키마 (8 테이블)
+- tokens, price_history, market_cap_history
+- volume_stats, liquidity_pools
+- holder_snapshots, top_holders
+- transactions, monitored_tokens
+
+---
+
 ## 메모
 
 ### 선행 조건
@@ -90,3 +136,8 @@
 1. 이 파일에서 현재 진행 상황 확인
 2. `⬜ 대기` 또는 `🔄 진행 중` 상태 태스크부터 시작
 3. 완료 시 상태를 `✅ 완료`로 변경
+
+### 다음 작업
+- Phase 2: Shyft 클라이언트 구현
+  - ShyftClient 래퍼 (REST API)
+  - gRPC 클라이언트 초기화
