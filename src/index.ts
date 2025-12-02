@@ -2,6 +2,7 @@ import { config, validateConfig } from './config/index.js';
 import { connectDatabase, disconnectDatabase } from './config/database.js';
 import { connectRedis, disconnectRedis } from './config/redis.js';
 import { logger } from './utils/logger.js';
+import { shyftClient, grpcClient, jupiterPriceClient } from './services/external/index.js';
 
 async function bootstrap(): Promise<void> {
   logger.info('Starting Solana Memecoin Data Collection System...');
@@ -15,13 +16,31 @@ async function bootstrap(): Promise<void> {
     await connectRedis();
 
     logger.info('All connections established successfully');
+
+    // Check external service configurations
+    const serviceStatus = {
+      shyft: shyftClient.isConfigured(),
+      grpc: grpcClient.isConfigured(),
+      jupiter: true, // Jupiter doesn't require API key
+    };
+
+    logger.info('External service status', serviceStatus);
+
+    if (serviceStatus.shyft && serviceStatus.grpc) {
+      logger.info('All external services configured - ready for data collection');
+    } else {
+      logger.warn('Some external services not configured', {
+        missingShyft: !serviceStatus.shyft,
+        missingGrpc: !serviceStatus.grpc,
+      });
+    }
+
     logger.info(`Server running in ${config.nodeEnv} mode`);
 
     // TODO: Initialize services
-    // - Shyft Client
-    // - gRPC Client
     // - BullMQ Workers
     // - API Server (if needed)
+    // - Transaction Streamer (Phase 3)
 
   } catch (error) {
     logger.error('Failed to start application', { error });
