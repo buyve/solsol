@@ -87,3 +87,45 @@ export async function findPDA(
 export function base58ToBytes(base58: string): Uint8Array {
   return new PublicKey(base58).toBytes();
 }
+
+/**
+ * Convert bytes to base58 string
+ */
+export function bytesToBase58(bytes: Uint8Array | Buffer): string {
+  try {
+    return new PublicKey(bytes).toBase58();
+  } catch {
+    // If the bytes don't represent a valid public key, use a hex fallback
+    return Buffer.from(bytes).toString('hex');
+  }
+}
+
+/**
+ * Encode signature bytes to base58
+ * Signatures are 64 bytes, not 32 bytes like public keys
+ */
+export function signatureToBase58(signatureBytes: Uint8Array | Buffer): string {
+  // For 64-byte signatures, we can't use PublicKey
+  // Use a simple base58 encoding alternative
+  const alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  const bytes = Buffer.from(signatureBytes);
+
+  if (bytes.length === 0) return '';
+
+  // Convert bytes to big integer
+  let num = BigInt('0x' + bytes.toString('hex'));
+  let result = '';
+
+  while (num > 0n) {
+    const remainder = Number(num % 58n);
+    num = num / 58n;
+    result = alphabet[remainder] + result;
+  }
+
+  // Add leading 1s for zero bytes
+  for (let i = 0; i < bytes.length && bytes[i] === 0; i++) {
+    result = '1' + result;
+  }
+
+  return result;
+}
