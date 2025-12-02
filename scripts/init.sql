@@ -69,8 +69,13 @@ CREATE TABLE IF NOT EXISTS liquidity_pools (
 CREATE TABLE IF NOT EXISTS holder_snapshots (
     id BIGSERIAL PRIMARY KEY,
     token_id INTEGER REFERENCES tokens(id) ON DELETE CASCADE,
+    mint_address VARCHAR(44) NOT NULL,
     total_holders INTEGER,
     top_10_percentage NUMERIC(5, 2),
+    top_20_percentage NUMERIC(5, 2),
+    top_50_percentage NUMERIC(5, 2),
+    gini_coefficient NUMERIC(6, 4),
+    top_holders_json JSONB,
     snapshot_time TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
@@ -120,6 +125,7 @@ CREATE INDEX IF NOT EXISTS idx_volume_token_time ON volume_stats(token_id, times
 CREATE INDEX IF NOT EXISTS idx_pools_token ON liquidity_pools(token_id);
 CREATE INDEX IF NOT EXISTS idx_pools_dex ON liquidity_pools(dex_name);
 CREATE INDEX IF NOT EXISTS idx_holders_token_time ON holder_snapshots(token_id, snapshot_time DESC);
+CREATE INDEX IF NOT EXISTS idx_holders_mint_time ON holder_snapshots(mint_address, snapshot_time DESC);
 CREATE INDEX IF NOT EXISTS idx_top_holders_token_time ON top_holders(token_id, snapshot_time DESC);
 CREATE INDEX IF NOT EXISTS idx_tx_token_time ON transactions(token_id, block_time DESC);
 CREATE INDEX IF NOT EXISTS idx_tx_signature ON transactions(signature);
