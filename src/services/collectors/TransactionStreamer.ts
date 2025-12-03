@@ -99,7 +99,9 @@ export class TransactionStreamer extends EventEmitter {
   constructor(options?: StreamerOptions) {
     super();
     this.grpcClient = new GrpcClient();
-    this.platforms = options?.platforms || ['pump.fun', 'letsbonk', 'moonshot'];
+    // Default to all supported platforms so we don't miss real trades
+    // Raydium is included because many memecoins migrate liquidity there
+    this.platforms = options?.platforms || ['pump.fun', 'letsbonk', 'moonshot', 'raydium'];
     this.commitment = options?.commitment || CommitmentLevel.PROCESSED;
     this.autoReconnect = options?.autoReconnect ?? true;
   }
