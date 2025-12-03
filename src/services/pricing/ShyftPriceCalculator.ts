@@ -231,6 +231,15 @@ export class ShyftPriceCalculator {
     });
 
     if (!response.ok) {
+      // 404: Not found, 417: Token not yet indexed (newly created tokens)
+      if (response.status === 404 || response.status === 417) {
+        logger.debug('Pool pair not found or not yet indexed', {
+          tokenA,
+          tokenB,
+          status: response.status,
+        });
+        return [];
+      }
       throw new Error(`Shyft DeFi API error: ${response.status}`);
     }
 
@@ -424,6 +433,14 @@ export class ShyftPriceCalculator {
     });
 
     if (!response.ok) {
+      // 404: Not found, 417: Token not yet indexed (newly created tokens)
+      if (response.status === 404 || response.status === 417) {
+        logger.debug('Token pools not found or not yet indexed', {
+          tokenMint,
+          status: response.status,
+        });
+        return [];
+      }
       throw new Error(`Shyft DeFi API error: ${response.status}`);
     }
 

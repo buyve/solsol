@@ -90,6 +90,12 @@ export class TransactionStreamer extends EventEmitter {
   private autoReconnect: boolean;
   private transactionCount: number = 0;
 
+  // Deduplication: track recently processed signatures to prevent duplicate events
+  // This is needed because same transaction can match multiple subscriptions (e.g., pumpfun + pumpswap)
+  private processedSignatures: Set<string> = new Set();
+  private readonly MAX_PROCESSED_SIGNATURES = 10000; // Keep last 10k signatures
+  private signatureCleanupCounter: number = 0;
+
   constructor(options?: StreamerOptions) {
     super();
     this.grpcClient = new GrpcClient();
@@ -259,6 +265,24 @@ export class TransactionStreamer extends EventEmitter {
     try {
       const parsed = this.parseTransaction(update);
       if (!parsed) return;
+
+      // Deduplication check: skip if we've already processed this signature
+      if (this.processedSignatures.has(parsed.signature)) {
+        logger.debug('Skipping duplicate transaction', {
+          signature: parsed.signature.substring(0, 20) + '...',
+        });
+        return;
+      }
+
+      // Mark as processed and manage set size
+      this.processedSignatures.add(parsed.signature);
+      this.signatureCleanupCounter++;
+
+      // Periodic cleanup to prevent memory leak
+      if (this.signatureCleanupCounter >= 1000) {
+        this.cleanupProcessedSignatures();
+        this.signatureCleanupCounter = 0;
+      }
 
       this.transactionCount++;
       this.emit('transaction', parsed);
@@ -709,17 +733,41 @@ export class TransactionStreamer extends EventEmitter {
   }
 
   /**
+   * Cleanup old processed signatures to prevent memory leak
+   * Keeps only the most recent signatures
+   */
+  private cleanupProcessedSignatures(): void {
+    if (this.processedSignatures.size <= this.MAX_PROCESSED_SIGNATURES) {
+      return;
+    }
+
+    // Convert to array, keep last MAX_PROCESSED_SIGNATURES entries
+    const signaturesArray = Array.from(this.processedSignatures);
+    const toKeep = signaturesArray.slice(-this.MAX_PROCESSED_SIGNATURES);
+
+    this.processedSignatures.clear();
+    toKeep.forEach(sig => this.processedSignatures.add(sig));
+
+    logger.debug('Cleaned up processed signatures', {
+      removed: signaturesArray.length - toKeep.length,
+      remaining: this.processedSignatures.size,
+    });
+  }
+
+  /**
    * Get streamer statistics
    */
   getStats(): {
     isRunning: boolean;
     transactionCount: number;
     platforms: LaunchPlatform[];
+    processedSignaturesCount: number;
   } {
     return {
       isRunning: this.isRunning,
       transactionCount: this.transactionCount,
       platforms: this.platforms,
+      processedSignaturesCount: this.processedSignatures.size,
     };
   }
 }
