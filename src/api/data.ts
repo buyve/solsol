@@ -417,4 +417,4 @@ router.get('/trending', async (req: Request, res: Response) => {
   }
 });
 
-export const dataRouter = router;
+export const dataRouter: Router = router;
